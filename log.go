@@ -65,6 +65,6 @@ func logError(fmt string, args ...interface{}) {
 
 func logFatal(fmt string, args ...interface{}) {
 	if config.LogLevel <= logLevelFatal {
-		log.Printf("[fatal] "+fmt, args...)
+		log.Fatalf("[fatal] "+fmt, args...)
 	}
 }
