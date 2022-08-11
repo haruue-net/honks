@@ -1,0 +1,11 @@
+{
+  "listen": "10.11.6.128:31080",  // Listen address
+  "timeout": 300, // TCP timeout in seconds
+  "disable_udp": false, // Disable UDP support
+  "users": [
+    // SOCKS5 authentication, leave it empty to disable authentication
+    { "username": "haruue", "password": "123456" },
+    { "username": "haruue1", "password": "1234567" }
+  ],
+  "log_level": "info" // log level, supports "verbose", "info", "error", "fatal"
+}

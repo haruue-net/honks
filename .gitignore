@@ -1,0 +1,5 @@
+/.idea
+*.exe
+/honks
+/honks.test
+/profile*.out
