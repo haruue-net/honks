@@ -4,9 +4,8 @@ import (
 	"crypto/subtle"
 	"fmt"
 	"github.com/flynn/json5"
-	lru "github.com/hashicorp/golang-lru"
+	"github.com/haruue-net/honks/socks5"
 	"github.com/tobyxdd/hysteria/pkg/acl"
-	"github.com/tobyxdd/hysteria/pkg/socks5"
 	"github.com/tobyxdd/hysteria/pkg/transport"
 	"io"
 	"log"
@@ -43,30 +42,14 @@ func main() {
 		}
 	}
 
-	cache, err := lru.NewARC(1024)
-	if err != nil {
-		logFatal("cannot create cache for acl: %s\n", err)
-		os.Exit(1)
-	}
-
-	aclEngine := acl.Engine{
-		DefaultAction: acl.ActionDirect,
-		Entries:       nil,
-		Cache:         cache,
-		ResolveIPAddr: func(s string) (*net.IPAddr, error) {
-			return net.ResolveIPAddr("ip", s)
-		},
-		GeoIPReader: nil,
-	}
-
 	af := authFunc
 	if len(config.Users) == 0 {
 		af = nil
 	}
 
-	server, err := socks5.NewServer(nil, transport.DefaultClientTransport, config.Listen,
+	server, err := socks5.NewServer(transport.DefaultClientTransport, config.Listen,
 		af, time.Duration(config.Timeout)*time.Second,
-		&aclEngine, config.DisableUDP,
+		nil, config.DisableUDP,
 		logTCPReqFunc, logTCPErrorFunc, logUDPAssocFunc, logUDPErrorFunc)
 	if err != nil {
 		log.Printf("[fatal] cannot create server: %s\n", err)
