@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"github.com/flynn/json5"
 	"github.com/haruue-net/honks/socks5"
-	"github.com/tobyxdd/hysteria/pkg/acl"
-	"github.com/tobyxdd/hysteria/pkg/transport"
 	"io"
 	"log"
 	"net"
@@ -47,10 +45,7 @@ func main() {
 		af = nil
 	}
 
-	server, err := socks5.NewServer(transport.DefaultClientTransport, config.Listen,
-		af, time.Duration(config.Timeout)*time.Second,
-		nil, config.DisableUDP,
-		logTCPReqFunc, logTCPErrorFunc, logUDPAssocFunc, logUDPErrorFunc)
+	server, err := socks5.NewServer(config.Listen, af, time.Duration(config.Timeout)*time.Second, config.DisableUDP, logTCPReqFunc, logTCPErrorFunc, logUDPAssocFunc, logUDPErrorFunc)
 	if err != nil {
 		log.Printf("[fatal] cannot create server: %s\n", err)
 		os.Exit(1)
@@ -93,7 +88,7 @@ func authFunc(username, password string) bool {
 	return false
 }
 
-func logTCPReqFunc(addr net.Addr, reqAddr string, action acl.Action, arg string) {
+func logTCPReqFunc(addr net.Addr, reqAddr string) {
 	logVerbose("tcp request: %s => %s\n", addr, reqAddr)
 }
 

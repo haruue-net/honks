@@ -12,10 +12,7 @@ package socks5
 import (
 	"encoding/binary"
 	"errors"
-	"fmt"
-	"github.com/tobyxdd/hysteria/pkg/acl"
-	"github.com/tobyxdd/hysteria/pkg/transport"
-	"github.com/tobyxdd/hysteria/pkg/utils"
+	"io"
 	"strconv"
 )
 
@@ -33,15 +30,13 @@ var (
 )
 
 type Server struct {
-	Transport  *transport.ClientTransport
 	AuthFunc   func(username, password string) bool
 	Method     byte
 	TCPAddr    *net.TCPAddr
 	TCPTimeout time.Duration
-	ACLEngine  *acl.Engine
 	DisableUDP bool
 
-	TCPRequestFunc   func(addr net.Addr, reqAddr string, action acl.Action, arg string)
+	TCPRequestFunc   func(addr net.Addr, reqAddr string)
 	TCPErrorFunc     func(addr net.Addr, reqAddr string, err error)
 	UDPAssociateFunc func(addr net.Addr)
 	UDPErrorFunc     func(addr net.Addr, err error)
@@ -49,7 +44,7 @@ type Server struct {
 	tcpListener *net.TCPListener
 }
 
-func NewServer(transport *transport.ClientTransport, addr string, authFunc func(username string, password string) bool, tcpTimeout time.Duration, aclEngine *acl.Engine, disableUDP bool, tcpReqFunc func(addr net.Addr, reqAddr string, action acl.Action, arg string), tcpErrorFunc func(addr net.Addr, reqAddr string, err error), udpAssocFunc func(addr net.Addr), udpErrorFunc func(addr net.Addr, err error)) (*Server, error) {
+func NewServer(addr string, authFunc func(username string, password string) bool, tcpTimeout time.Duration, disableUDP bool, tcpReqFunc func(addr net.Addr, reqAddr string), tcpErrorFunc func(addr net.Addr, reqAddr string, err error), udpAssocFunc func(addr net.Addr), udpErrorFunc func(addr net.Addr, err error)) (*Server, error) {
 	tAddr, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -59,12 +54,10 @@ func NewServer(transport *transport.ClientTransport, addr string, authFunc func(
 		m = socks5.MethodUsernamePassword
 	}
 	s := &Server{
-		Transport:        transport,
 		AuthFunc:         authFunc,
 		Method:           m,
 		TCPAddr:          tAddr,
 		TCPTimeout:       tcpTimeout,
-		ACLEngine:        aclEngine,
 		DisableUDP:       disableUDP,
 		TCPRequestFunc:   tcpReqFunc,
 		TCPErrorFunc:     tcpErrorFunc,
@@ -168,74 +161,34 @@ func (s *Server) handle(c *net.TCPConn, r *socks5.Request) error {
 
 func (s *Server) handleTCP(c *net.TCPConn, r *socks5.Request) error {
 	host, port, addr := parseRequestAddress(r)
-	action, arg := acl.ActionDirect, ""
 	var ipAddr *net.IPAddr
 	var resErr error
-	if s.ACLEngine != nil {
-		action, arg, _, ipAddr, resErr = s.ACLEngine.ResolveAndMatch(host, port, false)
-	} else {
-		ipAddr, resErr = net.ResolveIPAddr("ip", host)
-	}
-	s.TCPRequestFunc(c.RemoteAddr(), addr, action, arg)
+	ipAddr, resErr = net.ResolveIPAddr("ip", host)
+	s.TCPRequestFunc(c.RemoteAddr(), addr)
 	var closeErr error
 	defer func() {
 		s.TCPErrorFunc(c.RemoteAddr(), addr, closeErr)
 	}()
-	// Handle according to the action
-	switch action {
-	case acl.ActionProxy:
-		// we do not support actionProxy, but can just map actionProxy to actionDirect now
-		fallthrough
-	case acl.ActionDirect:
-		if resErr != nil {
-			_ = sendReply(c, socks5.RepHostUnreachable)
-			closeErr = resErr
-			return resErr
-		}
-		rc, err := s.Transport.DialTCP(&net.TCPAddr{
-			IP:   ipAddr.IP,
-			Port: int(port),
-			Zone: ipAddr.Zone,
-		})
-		if err != nil {
-			_ = sendReply(c, socks5.RepHostUnreachable)
-			closeErr = err
-			return err
-		}
-		defer rc.Close()
-		_ = sendReply(c, socks5.RepSuccess)
-		closeErr = utils.PipePairWithTimeout(c, rc, s.TCPTimeout)
-		return nil
-	case acl.ActionBlock:
+
+	if resErr != nil {
 		_ = sendReply(c, socks5.RepHostUnreachable)
-		closeErr = errors.New("blocked in ACL")
-		return nil
-	case acl.ActionHijack:
-		hijackIPAddr, err := s.Transport.ResolveIPAddr(arg)
-		if err != nil {
-			_ = sendReply(c, socks5.RepHostUnreachable)
-			closeErr = err
-			return err
-		}
-		rc, err := s.Transport.DialTCP(&net.TCPAddr{
-			IP:   hijackIPAddr.IP,
-			Port: int(port),
-			Zone: hijackIPAddr.Zone,
-		})
-		if err != nil {
-			_ = sendReply(c, socks5.RepHostUnreachable)
-			closeErr = err
-			return err
-		}
-		defer rc.Close()
-		_ = sendReply(c, socks5.RepSuccess)
-		closeErr = utils.PipePairWithTimeout(c, rc, s.TCPTimeout)
-		return nil
-	default:
-		_ = sendReply(c, socks5.RepServerFailure)
-		closeErr = fmt.Errorf("unknown action %d", action)
-		return nil
+		closeErr = resErr
+		return resErr
 	}
+	rc, err := net.DialTCP("tcp", nil, &net.TCPAddr{
+		IP:   ipAddr.IP,
+		Port: int(port),
+		Zone: ipAddr.Zone,
+	})
+	if err != nil {
+		_ = sendReply(c, socks5.RepHostUnreachable)
+		closeErr = err
+		return err
+	}
+	defer rc.Close()
+	_ = sendReply(c, socks5.RepSuccess)
+	closeErr = pipePairWithTimeout(c, rc, s.TCPTimeout)
+	return nil
 }
 
 func (s *Server) handleUDP(c *net.TCPConn, r *socks5.Request) error {
@@ -257,7 +210,7 @@ func (s *Server) handleUDP(c *net.TCPConn, r *socks5.Request) error {
 	defer udpConn.Close()
 	// Local UDP relay conn for ACL Direct
 	var localRelayConn *net.UDPConn
-	localRelayConn, err = s.Transport.ListenUDP()
+	localRelayConn, err = net.ListenUDP("udp", nil)
 	if err != nil {
 		_ = sendReply(c, socks5.RepServerFailure)
 		closeErr = err
@@ -341,41 +294,17 @@ func (s *Server) udpServer(clientConn *net.UDPConn, localRelayConn *net.UDPConn)
 			continue
 		}
 		host, port, _ := parseDatagramRequestAddress(d)
-		action, arg := acl.ActionDirect, ""
 		var ipAddr *net.IPAddr
 		var resErr error
-		if s.ACLEngine != nil {
-			action, arg, _, ipAddr, resErr = s.ACLEngine.ResolveAndMatch(host, port, true)
-		} else {
-			ipAddr, resErr = net.ResolveIPAddr("ip", host)
+		ipAddr, resErr = net.ResolveIPAddr("ip", host)
+		if resErr != nil {
+			return
 		}
-		// Handle according to the action
-		switch action {
-		case acl.ActionProxy:
-			fallthrough
-		case acl.ActionDirect:
-			if resErr != nil {
-				return
-			}
-			_, _ = localRelayConn.WriteToUDP(d.Data, &net.UDPAddr{
-				IP:   ipAddr.IP,
-				Port: int(port),
-				Zone: ipAddr.Zone,
-			})
-		case acl.ActionBlock:
-			// Do nothing
-		case acl.ActionHijack:
-			hijackIPAddr, err := s.Transport.ResolveIPAddr(arg)
-			if err == nil {
-				_, _ = localRelayConn.WriteToUDP(d.Data, &net.UDPAddr{
-					IP:   hijackIPAddr.IP,
-					Port: int(port),
-					Zone: hijackIPAddr.Zone,
-				})
-			}
-		default:
-			// Do nothing
-		}
+		_, _ = localRelayConn.WriteToUDP(d.Data, &net.UDPAddr{
+			IP:   ipAddr.IP,
+			Port: int(port),
+			Zone: ipAddr.Zone,
+		})
 	}
 }
 
@@ -405,4 +334,53 @@ func parseDatagramRequestAddress(r *socks5.Datagram) (host string, port uint16, 
 		ipStr := net.IP(r.DstAddr).String()
 		return ipStr, p, net.JoinHostPort(ipStr, strconv.Itoa(int(p)))
 	}
+}
+
+const kPipeBufferSize = 65535
+
+func pipePairWithTimeout(conn net.Conn, stream io.ReadWriteCloser, timeout time.Duration) error {
+	errChan := make(chan error, 2)
+	// TCP to stream
+	go func() {
+		buf := make([]byte, kPipeBufferSize)
+		for {
+			if timeout != 0 {
+				_ = conn.SetDeadline(time.Now().Add(timeout))
+			}
+			rn, err := conn.Read(buf)
+			if rn > 0 {
+				_, err := stream.Write(buf[:rn])
+				if err != nil {
+					errChan <- err
+					return
+				}
+			}
+			if err != nil {
+				errChan <- err
+				return
+			}
+		}
+	}()
+	// Stream to TCP
+	go func() {
+		buf := make([]byte, kPipeBufferSize)
+		for {
+			rn, err := stream.Read(buf)
+			if rn > 0 {
+				_, err := conn.Write(buf[:rn])
+				if err != nil {
+					errChan <- err
+					return
+				}
+				if timeout != 0 {
+					_ = conn.SetDeadline(time.Now().Add(timeout))
+				}
+			}
+			if err != nil {
+				errChan <- err
+				return
+			}
+		}
+	}()
+	return <-errChan
 }
