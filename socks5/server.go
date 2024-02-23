@@ -1,386 +1,298 @@
-// SPDX-License-Identifier: MIT
-/* (c) 2021 Toby
- * (c) 2022 Haruue Icymoon <i@haruue.moe>
- */
-
-// most codes here is copied from hysteria project.
-// https://github.com/HyNetwork/hysteria/blob/ab2ad4aa6d44785bb8a8caea1a22c9a8bb534a37/pkg/socks5/server.go
-// modified by haruue to remove dependency of hysteria client.
-
 package socks5
 
 import (
 	"encoding/binary"
-	"errors"
 	"io"
-	"strconv"
-)
-
-import (
-	"github.com/txthinking/socks5"
 	"net"
-	"time"
+
+	"github.com/txthinking/socks5"
 )
 
-const udpBufferSize = 65535
+const udpBufferSize = 4096
 
-var (
-	ErrUnsupportedCmd = errors.New("unsupported command")
-	ErrUserPassAuth   = errors.New("invalid username or password")
-)
-
+// Server is a SOCKS5 server using a Hysteria client as outbound.
 type Server struct {
-	AuthFunc   func(username, password string) bool
-	Method     byte
-	TCPAddr    *net.TCPAddr
-	TCPTimeout time.Duration
-	DisableUDP bool
-
-	TCPRequestFunc   func(addr net.Addr, reqAddr string)
-	TCPErrorFunc     func(addr net.Addr, reqAddr string, err error)
-	UDPAssociateFunc func(addr net.Addr)
-	UDPErrorFunc     func(addr net.Addr, err error)
-
-	tcpListener *net.TCPListener
+	HyClient    FakeHyClient
+	AuthFunc    func(username, password string) bool // nil = no authentication
+	DisableUDP  bool
+	EventLogger EventLogger
 }
 
-func NewServer(addr string, authFunc func(username string, password string) bool, tcpTimeout time.Duration, disableUDP bool, tcpReqFunc func(addr net.Addr, reqAddr string), tcpErrorFunc func(addr net.Addr, reqAddr string, err error), udpAssocFunc func(addr net.Addr), udpErrorFunc func(addr net.Addr, err error)) (*Server, error) {
-	tAddr, err := net.ResolveTCPAddr("tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-	m := socks5.MethodNone
-	if authFunc != nil {
-		m = socks5.MethodUsernamePassword
-	}
-	s := &Server{
-		AuthFunc:         authFunc,
-		Method:           m,
-		TCPAddr:          tAddr,
-		TCPTimeout:       tcpTimeout,
-		DisableUDP:       disableUDP,
-		TCPRequestFunc:   tcpReqFunc,
-		TCPErrorFunc:     tcpErrorFunc,
-		UDPAssociateFunc: udpAssocFunc,
-		UDPErrorFunc:     udpErrorFunc,
-	}
-	return s, nil
+type EventLogger interface {
+	TCPRequest(addr net.Addr, reqAddr string)
+	TCPError(addr net.Addr, reqAddr string, err error)
+	UDPRequest(addr net.Addr)
+	UDPError(addr net.Addr, err error)
 }
 
-func (s *Server) negotiate(c *net.TCPConn) error {
-	rq, err := socks5.NewNegotiationRequestFrom(c)
-	if err != nil {
-		return err
-	}
-	var got bool
-	var m byte
-	for _, m = range rq.Methods {
-		if m == s.Method {
-			got = true
-		}
-	}
-	if !got {
-		rp := socks5.NewNegotiationReply(socks5.MethodUnsupportAll)
-		if _, err := rp.WriteTo(c); err != nil {
-			return err
-		}
-	}
-	rp := socks5.NewNegotiationReply(s.Method)
-	if _, err := rp.WriteTo(c); err != nil {
-		return err
-	}
-
-	if s.Method == socks5.MethodUsernamePassword {
-		urq, err := socks5.NewUserPassNegotiationRequestFrom(c)
-		if err != nil {
-			return err
-		}
-		if !s.AuthFunc(string(urq.Uname), string(urq.Passwd)) {
-			urp := socks5.NewUserPassNegotiationReply(socks5.UserPassStatusFailure)
-			if _, err := urp.WriteTo(c); err != nil {
-				return err
-			}
-			return ErrUserPassAuth
-		}
-		urp := socks5.NewUserPassNegotiationReply(socks5.UserPassStatusSuccess)
-		if _, err := urp.WriteTo(c); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *Server) ListenAndServe() error {
-	var err error
-	s.tcpListener, err = net.ListenTCP("tcp", s.TCPAddr)
-	if err != nil {
-		return err
-	}
-	defer s.tcpListener.Close()
+func (s *Server) Serve(listener Accepter) error {
 	for {
-		c, err := s.tcpListener.AcceptTCP()
+		conn, err := listener.Accept()
 		if err != nil {
 			return err
 		}
-		go func() {
-			defer c.Close()
-			if s.TCPTimeout != 0 {
-				if err := c.SetDeadline(time.Now().Add(s.TCPTimeout)); err != nil {
-					return
-				}
-			}
-			if err := s.negotiate(c); err != nil {
-				return
-			}
-			r, err := socks5.NewRequestFrom(c)
-			if err != nil {
-				return
-			}
-			_ = s.handle(c, r)
-		}()
+		go s.dispatch(conn)
 	}
 }
 
-func (s *Server) handle(c *net.TCPConn, r *socks5.Request) error {
-	if r.Cmd == socks5.CmdConnect {
-		// TCP
-		return s.handleTCP(c, r)
-	} else if r.Cmd == socks5.CmdUDP {
-		// UDP
-		if !s.DisableUDP {
-			return s.handleUDP(c, r)
-		} else {
-			_ = sendReply(c, socks5.RepCommandNotSupported)
-			return ErrUnsupportedCmd
+func (s *Server) dispatch(conn net.Conn) {
+	ok, _ := s.negotiate(conn)
+	if !ok {
+		_ = conn.Close()
+		return
+	}
+	// Negotiation ok, get and handle the request
+	req, err := socks5.NewRequestFrom(conn)
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
+	switch req.Cmd {
+	case socks5.CmdConnect: // TCP
+		s.handleTCP(conn, req)
+	case socks5.CmdUDP: // UDP
+		if s.DisableUDP {
+			_ = sendSimpleReply(conn, socks5.RepCommandNotSupported)
+			_ = conn.Close()
+			return
 		}
+		s.handleUDP(conn, req)
+	default:
+		_ = sendSimpleReply(conn, socks5.RepCommandNotSupported)
+		_ = conn.Close()
+	}
+}
+
+func (s *Server) negotiate(conn net.Conn) (bool, error) {
+	req, err := socks5.NewNegotiationRequestFrom(conn)
+	if err != nil {
+		return false, err
+	}
+	var serverMethod byte
+	if s.AuthFunc != nil {
+		serverMethod = socks5.MethodUsernamePassword
 	} else {
-		_ = sendReply(c, socks5.RepCommandNotSupported)
-		return ErrUnsupportedCmd
+		serverMethod = socks5.MethodNone
 	}
+	// Look for the supported method in the client request
+	supported := false
+	for _, m := range req.Methods {
+		if m == serverMethod {
+			supported = true
+			break
+		}
+	}
+	if !supported {
+		// No supported method found, reject the client
+		rep := socks5.NewNegotiationReply(socks5.MethodUnsupportAll)
+		_, err := rep.WriteTo(conn)
+		return false, err
+	}
+	// OK, send the method we chose
+	rep := socks5.NewNegotiationReply(serverMethod)
+	_, err = rep.WriteTo(conn)
+	if err != nil {
+		return false, err
+	}
+	// If we chose the username/password method, authenticate the client
+	if serverMethod == socks5.MethodUsernamePassword {
+		req, err := socks5.NewUserPassNegotiationRequestFrom(conn)
+		if err != nil {
+			return false, err
+		}
+		ok := s.AuthFunc(string(req.Uname), string(req.Passwd))
+		if ok {
+			rep := socks5.NewUserPassNegotiationReply(socks5.UserPassStatusSuccess)
+			_, err := rep.WriteTo(conn)
+			if err != nil {
+				return false, err
+			}
+		} else {
+			rep := socks5.NewUserPassNegotiationReply(socks5.UserPassStatusFailure)
+			_, err := rep.WriteTo(conn)
+			return false, err
+		}
+	}
+	return true, nil
 }
 
-func (s *Server) handleTCP(c *net.TCPConn, r *socks5.Request) error {
-	host, port, addr := parseRequestAddress(r)
-	var ipAddr *net.IPAddr
-	var resErr error
-	ipAddr, resErr = net.ResolveIPAddr("ip", host)
-	s.TCPRequestFunc(c.RemoteAddr(), addr)
+func (s *Server) handleTCP(conn net.Conn, req *socks5.Request) {
+	defer conn.Close()
+
+	addr := req.Address()
+
+	// TCP request & error log
+	if s.EventLogger != nil {
+		s.EventLogger.TCPRequest(conn.RemoteAddr(), addr)
+	}
 	var closeErr error
 	defer func() {
-		s.TCPErrorFunc(c.RemoteAddr(), addr, closeErr)
+		if s.EventLogger != nil {
+			s.EventLogger.TCPError(conn.RemoteAddr(), addr, closeErr)
+		}
 	}()
 
-	if resErr != nil {
-		_ = sendReply(c, socks5.RepHostUnreachable)
-		closeErr = resErr
-		return resErr
-	}
-	rc, err := net.DialTCP("tcp", nil, &net.TCPAddr{
-		IP:   ipAddr.IP,
-		Port: int(port),
-		Zone: ipAddr.Zone,
-	})
+	// Dial
+	rConn, err := s.HyClient.TCP(addr)
 	if err != nil {
-		_ = sendReply(c, socks5.RepHostUnreachable)
+		_ = sendSimpleReply(conn, socks5.RepHostUnreachable)
 		closeErr = err
-		return err
+		return
 	}
-	defer rc.Close()
-	_ = sendReply(c, socks5.RepSuccess)
-	closeErr = pipePairWithTimeout(c, rc, s.TCPTimeout)
-	return nil
+	defer rConn.Close()
+
+	// Send reply and start relaying
+	_ = sendSimpleReply(conn, socks5.RepSuccess)
+	copyErrChan := make(chan error, 2)
+	go func() {
+		_, err := io.Copy(rConn, conn)
+		copyErrChan <- err
+	}()
+	go func() {
+		_, err := io.Copy(conn, rConn)
+		copyErrChan <- err
+	}()
+	closeErr = <-copyErrChan
 }
 
-func (s *Server) handleUDP(c *net.TCPConn, r *socks5.Request) error {
-	s.UDPAssociateFunc(c.RemoteAddr())
+func (s *Server) handleUDP(conn net.Conn, req *socks5.Request) {
+	defer conn.Close()
+
+	// UDP request & error log
+	if s.EventLogger != nil {
+		s.EventLogger.UDPRequest(conn.RemoteAddr())
+	}
 	var closeErr error
 	defer func() {
-		s.UDPErrorFunc(c.RemoteAddr(), closeErr)
+		if s.EventLogger != nil {
+			s.EventLogger.UDPError(conn.RemoteAddr(), closeErr)
+		}
 	}()
-	// Start local UDP server
-	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{
-		IP:   s.TCPAddr.IP,
-		Zone: s.TCPAddr.Zone,
-	})
+
+	// Start UDP relay server
+	// SOCKS5 UDP requires the server to return the UDP bind address and port in the reply.
+	// We bind to the same address that our TCP server listens on (but a different port).
+	host, _, err := net.SplitHostPort(conn.LocalAddr().String())
 	if err != nil {
-		_ = sendReply(c, socks5.RepServerFailure)
+		// Is this even possible?
+		_ = sendSimpleReply(conn, socks5.RepServerFailure)
 		closeErr = err
-		return err
+		return
+	}
+	udpAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, "0"))
+	if err != nil {
+		_ = sendSimpleReply(conn, socks5.RepServerFailure)
+		closeErr = err
+		return
+	}
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		_ = sendSimpleReply(conn, socks5.RepServerFailure)
+		closeErr = err
+		return
 	}
 	defer udpConn.Close()
-	// Local UDP relay conn for ACL Direct
-	var localRelayConn *net.UDPConn
-	localRelayConn, err = net.ListenUDP("udp", nil)
+
+	// HyClient UDP session
+	hyUDP, err := s.HyClient.UDP()
 	if err != nil {
-		_ = sendReply(c, socks5.RepServerFailure)
+		_ = sendSimpleReply(conn, socks5.RepServerFailure)
 		closeErr = err
-		return err
+		return
 	}
-	defer localRelayConn.Close()
-	// Send UDP server addr to the client
-	// Same IP as TCP but a different port
-	tcpLocalAddr := c.LocalAddr().(*net.TCPAddr)
-	var atyp byte
-	var addr, port []byte
-	if ip4 := tcpLocalAddr.IP.To4(); ip4 != nil {
-		atyp = socks5.ATYPIPv4
-		addr = ip4
-	} else if ip6 := tcpLocalAddr.IP.To16(); ip6 != nil {
-		atyp = socks5.ATYPIPv6
-		addr = ip6
-	} else {
-		_ = sendReply(c, socks5.RepServerFailure)
-		closeErr = errors.New("invalid local addr")
-		return closeErr
-	}
-	port = make([]byte, 2)
-	binary.BigEndian.PutUint16(port, uint16(udpConn.LocalAddr().(*net.UDPAddr).Port))
-	_, _ = socks5.NewReply(socks5.RepSuccess, atyp, addr, port).WriteTo(c)
-	// Let UDP server do its job, we hold the TCP connection here
-	go s.udpServer(udpConn, localRelayConn)
-	if s.TCPTimeout != 0 {
-		// Disable TCP timeout for UDP holder
-		_ = c.SetDeadline(time.Time{})
-	}
-	buf := make([]byte, 1024)
-	for {
-		_, err := c.Read(buf)
-		if err != nil {
-			closeErr = err
-			break
-		}
-	}
-	// As the TCP connection closes, so does the UDP server & HyClient session
-	return nil
+	defer hyUDP.Close()
+
+	// Send reply
+	_ = sendUDPReply(conn, udpConn.LocalAddr().(*net.UDPAddr))
+
+	// UDP relay & SOCKS5 connection holder
+	errChan := make(chan error, 2)
+	go func() {
+		err := s.udpServer(udpConn, hyUDP)
+		errChan <- err
+	}()
+	go func() {
+		_, err := io.Copy(io.Discard, conn)
+		errChan <- err
+	}()
+	closeErr = <-errChan
 }
 
-func (s *Server) udpServer(clientConn *net.UDPConn, localRelayConn *net.UDPConn) {
+func (s *Server) udpServer(udpConn *net.UDPConn, hyUDP FakeHyUDPConn) error {
 	var clientAddr *net.UDPAddr
 	buf := make([]byte, udpBufferSize)
-	// Local to remote
+	// local -> remote
 	for {
-		n, cAddr, err := clientConn.ReadFromUDP(buf)
+		n, cAddr, err := udpConn.ReadFromUDP(buf)
 		if err != nil {
-			break
+			return err
 		}
 		d, err := socks5.NewDatagramFromBytes(buf[:n])
 		if err != nil || d.Frag != 0 {
 			// Ignore bad packets
+			// Also we don't support SOCKS5 UDP fragmentation for now
 			continue
 		}
 		if clientAddr == nil {
-			// Whoever sends the first valid packet is our client
+			// Before the first packet, we don't know what IP the client will use to send us packets,
+			// so we don't know what IP to return packets to.
+			// We treat whoever sends us the first packet as our client.
 			clientAddr = cAddr
-			// Start remote to local
+			// Now that we know the client's address, we can start the
+			// remote -> local direction.
 			go func() {
-				buf := make([]byte, udpBufferSize)
 				for {
-					n, from, err := localRelayConn.ReadFrom(buf)
-					if n > 0 {
-						atyp, addr, port, err := socks5.ParseAddress(from.String())
-						if err != nil {
-							continue
-						}
-						d := socks5.NewDatagram(atyp, addr, port, buf[:n])
-						_, _ = clientConn.WriteToUDP(d.Bytes(), clientAddr)
-					}
+					bs, from, err := hyUDP.Receive()
 					if err != nil {
-						break
+						// Close the UDP conn so that the local -> remote direction will exit
+						_ = udpConn.Close()
+						return
 					}
+					atyp, addr, port, err := socks5.ParseAddress(from)
+					if err != nil {
+						continue
+					}
+					if atyp == socks5.ATYPDomain {
+						// socks5.ParseAddress adds a leading byte for domains,
+						// but socks5.NewDatagram will add it again as it expects a raw domain.
+						// So we must remove it here.
+						addr = addr[1:]
+					}
+					d := socks5.NewDatagram(atyp, addr, port, bs)
+					_, _ = udpConn.WriteToUDP(d.Bytes(), clientAddr)
 				}
 			}()
-		} else if cAddr.String() != clientAddr.String() {
-			// Not our client, bye
+		} else if !clientAddr.IP.Equal(cAddr.IP) || clientAddr.Port != cAddr.Port {
+			// Not our client, ignore
 			continue
 		}
-		host, port, _ := parseDatagramRequestAddress(d)
-		var ipAddr *net.IPAddr
-		var resErr error
-		ipAddr, resErr = net.ResolveIPAddr("ip", host)
-		if resErr != nil {
-			return
-		}
-		_, _ = localRelayConn.WriteToUDP(d.Data, &net.UDPAddr{
-			IP:   ipAddr.IP,
-			Port: int(port),
-			Zone: ipAddr.Zone,
-		})
+		// Send to remote
+		_ = hyUDP.Send(d.Data, d.Address())
 	}
 }
 
-func sendReply(conn *net.TCPConn, rep byte) error {
+// sendSimpleReply sends a SOCKS5 reply with the given reply code.
+// It does not contain bind address or port, so it's not suitable for successful UDP requests.
+func sendSimpleReply(conn net.Conn, rep byte) error {
 	p := socks5.NewReply(rep, socks5.ATYPIPv4, []byte{0x00, 0x00, 0x00, 0x00}, []byte{0x00, 0x00})
 	_, err := p.WriteTo(conn)
 	return err
 }
 
-func parseRequestAddress(r *socks5.Request) (host string, port uint16, addr string) {
-	p := binary.BigEndian.Uint16(r.DstPort)
-	if r.Atyp == socks5.ATYPDomain {
-		d := string(r.DstAddr[1:])
-		return d, p, net.JoinHostPort(d, strconv.Itoa(int(p)))
+// sendUDPReply sends a SOCKS5 reply with the given reply code and bind address/port.
+func sendUDPReply(conn net.Conn, addr *net.UDPAddr) error {
+	var atyp byte
+	var bndAddr, bndPort []byte
+	if ip4 := addr.IP.To4(); ip4 != nil {
+		atyp = socks5.ATYPIPv4
+		bndAddr = ip4
 	} else {
-		ipStr := net.IP(r.DstAddr).String()
-		return ipStr, p, net.JoinHostPort(ipStr, strconv.Itoa(int(p)))
+		atyp = socks5.ATYPIPv6
+		bndAddr = addr.IP
 	}
-}
-
-func parseDatagramRequestAddress(r *socks5.Datagram) (host string, port uint16, addr string) {
-	p := binary.BigEndian.Uint16(r.DstPort)
-	if r.Atyp == socks5.ATYPDomain {
-		d := string(r.DstAddr[1:])
-		return d, p, net.JoinHostPort(d, strconv.Itoa(int(p)))
-	} else {
-		ipStr := net.IP(r.DstAddr).String()
-		return ipStr, p, net.JoinHostPort(ipStr, strconv.Itoa(int(p)))
-	}
-}
-
-const kPipeBufferSize = 65535
-
-func pipePairWithTimeout(conn net.Conn, stream io.ReadWriteCloser, timeout time.Duration) error {
-	errChan := make(chan error, 2)
-	// TCP to stream
-	go func() {
-		buf := make([]byte, kPipeBufferSize)
-		for {
-			if timeout != 0 {
-				_ = conn.SetDeadline(time.Now().Add(timeout))
-			}
-			rn, err := conn.Read(buf)
-			if rn > 0 {
-				_, err := stream.Write(buf[:rn])
-				if err != nil {
-					errChan <- err
-					return
-				}
-			}
-			if err != nil {
-				errChan <- err
-				return
-			}
-		}
-	}()
-	// Stream to TCP
-	go func() {
-		buf := make([]byte, kPipeBufferSize)
-		for {
-			rn, err := stream.Read(buf)
-			if rn > 0 {
-				_, err := conn.Write(buf[:rn])
-				if err != nil {
-					errChan <- err
-					return
-				}
-				if timeout != 0 {
-					_ = conn.SetDeadline(time.Now().Add(timeout))
-				}
-			}
-			if err != nil {
-				errChan <- err
-				return
-			}
-		}
-	}()
-	return <-errChan
+	bndPort = make([]byte, 2)
+	binary.BigEndian.PutUint16(bndPort, uint16(addr.Port))
+	p := socks5.NewReply(socks5.RepSuccess, atyp, bndAddr, bndPort)
+	_, err := p.WriteTo(conn)
+	return err
 }

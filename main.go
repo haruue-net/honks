@@ -1,15 +1,16 @@
 package main
 
 import (
-	"crypto/subtle"
 	"fmt"
 	"github.com/flynn/json5"
 	"github.com/haruue-net/honks/socks5"
 	"io"
-	"log"
 	"net"
 	"os"
-	"time"
+)
+
+const (
+	udpPacketBufferSize = 65535
 )
 
 func showUsage(writer io.Writer) {
@@ -17,7 +18,6 @@ func showUsage(writer io.Writer) {
 }
 
 var config Config
-var users map[string]User // username => user
 
 func main() {
 	if len(os.Args) != 2 {
@@ -40,19 +40,34 @@ func main() {
 		}
 	}
 
-	af := authFunc
-	if len(config.Users) == 0 {
-		af = nil
+	if len(config.Listen) == 0 {
+		logFatal("no listen address specified\n")
 	}
 
-	server, err := socks5.NewServer(config.Listen, af, time.Duration(config.Timeout)*time.Second, config.DisableUDP, logTCPReqFunc, logTCPErrorFunc, logUDPAssocFunc, logUDPErrorFunc)
-	if err != nil {
-		log.Printf("[fatal] cannot create server: %s\n", err)
-		os.Exit(1)
+	authFunc := config.Users.AuthFunc
+	if !config.Users.AuthEnabled() {
+		authFunc = nil
 	}
 
-	logInfo("listen on %s\n", config.Listen)
-	logFatal("server exit: %s\n", server.ListenAndServe())
+	mlis := NewMultipleListener()
+	defer mlis.Close()
+	for _, listenAddr := range config.Listen {
+		logInfo("listen on %s\n", listenAddr)
+		lis, err := net.Listen("tcp", listenAddr)
+		if err != nil {
+			logFatal("cannot listen on %s: %s\n", listenAddr, err)
+		}
+		mlis.Add(lis)
+	}
+
+	server := socks5.Server{
+		HyClient:    localOutbound{},
+		AuthFunc:    authFunc,
+		DisableUDP:  config.DisableUDP,
+		EventLogger: eventLogger{},
+	}
+
+	logFatal("server exit: %v\n", server.Serve(mlis))
 }
 
 func readConfig(path string) (err error) {
@@ -67,39 +82,72 @@ func readConfig(path string) (err error) {
 		return
 	}
 
-	users = make(map[string]User)
-	for _, user := range config.Users {
-		users[user.Username] = user
-	}
-
 	return
 }
 
-func authFunc(username, password string) bool {
-	if user, ok := users[username]; ok {
-		if subtle.ConstantTimeCompare([]byte(user.Password), []byte(password)) == 1 {
-			logVerbose("user %s authenticated\n", username)
-			return true
-		}
-		logError("user %s authentication failed\n", username)
-		return false
-	}
-	logError("user %s not found\n", username)
-	return false
-}
+type eventLogger struct{}
 
-func logTCPReqFunc(addr net.Addr, reqAddr string) {
+func (eventLogger) TCPRequest(addr net.Addr, reqAddr string) {
 	logVerbose("tcp request: %s => %s\n", addr, reqAddr)
 }
 
-func logTCPErrorFunc(addr net.Addr, reqAddr string, err error) {
-	logVerbose("tcp error: %s => %s: %s\n", addr, reqAddr, err)
+func (eventLogger) TCPError(addr net.Addr, reqAddr string, err error) {
+	if err != nil {
+		logVerbose("tcp error: %s => %s: %s\n", addr, reqAddr, err)
+	}
+	logVerbose("tcp done: %s => %s\n", addr, reqAddr)
 }
 
-func logUDPAssocFunc(addr net.Addr) {
-	logVerbose("udp association from %s\n", addr)
+func (eventLogger) UDPRequest(addr net.Addr) {
+	logVerbose("udp request from %s\n", addr)
 }
 
-func logUDPErrorFunc(addr net.Addr, err error) {
-	logVerbose("udp association error from %s: %s\n", addr, err)
+func (eventLogger) UDPError(addr net.Addr, err error) {
+	if err != nil {
+		logVerbose("udp error from %s: %s\n", addr, err)
+	}
+	logVerbose("udp done from %s\n", addr)
+}
+
+type localOutbound struct{}
+
+func (localOutbound) TCP(addr string) (net.Conn, error) {
+	return net.Dial("tcp", addr)
+}
+
+func (localOutbound) UDP() (socks5.FakeHyUDPConn, error) {
+	udpConn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		return nil, err
+	}
+	return &localUDPConn{UDPConn: udpConn}, nil
+}
+
+func (localOutbound) Close() error {
+	return nil
+}
+
+type localUDPConn struct {
+	*net.UDPConn
+}
+
+func (c *localUDPConn) Receive() (b []byte, addr string, err error) {
+	bs := make([]byte, udpPacketBufferSize)
+	n, udpAddr, err := c.UDPConn.ReadFromUDP(bs)
+	if err != nil {
+		return
+	}
+	addr = udpAddr.String()
+	b = make([]byte, n)
+	copy(b, bs[:n])
+	return
+}
+
+func (c *localUDPConn) Send(b []byte, addr string) error {
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return err
+	}
+	_, err = c.UDPConn.WriteToUDP(b, udpAddr)
+	return err
 }
