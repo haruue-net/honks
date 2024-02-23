@@ -1,3 +1,12 @@
+// SPDX-License-Identifier: MIT
+/* (c) 2023 Toby
+ * (c) 2024 Haruue Icymoon <i@haruue.moe>
+ */
+
+// most codes here is copied from hysteria project.
+// https://github.com/apernet/hysteria/blob/ea66299d0f339630d482038cd2e8ca74346f4ac0/app/internal/socks5/server.go
+// modified by haruue to remove dependency of hysteria client.
+
 package socks5
 
 import (
